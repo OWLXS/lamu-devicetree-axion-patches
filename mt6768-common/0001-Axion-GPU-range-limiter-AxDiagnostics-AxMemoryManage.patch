@@ -1,0 +1,314 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Thu, 1 Oct 2026 22:14:18 -0300
+Subject: [PATCH] Axion: GPU range-limiter/AxDiagnostics/AxMemoryManager chain
+
+Axion Kernel Manager's GPU devfreq/gpufreqv2 control (chown+sepolicy),
+AxDiagnostics GPU tab support, AxionFx effect library registration, window
+blur enable, and AxMemoryManager per-app swappiness sepolicy. Requires the
+matching device/axion/common + packages/apps/AxionFx + axion_sdk pieces to
+do anything - safe to apply on its own otherwise (nothing reads these nodes
+without those).
+---
+ configs/audio/audio_effects_config.xml |  2 +
+ init/init.mt6768.rc                    | 60 +++++++++++++++++++++++
+ sepolicy/vendor/ax_diagnostics.te      | 67 ++++++++++++++++++++++++++
+ sepolicy/vendor/ax_kernel_manager.te   | 45 +++++++++++++++++
+ sepolicy/vendor/file.te                |  9 ++++
+ sepolicy/vendor/genfs_contexts         |  2 +
+ sepolicy/vendor/init.te                | 21 ++++++++
+ vendor.prop                            |  2 +-
+ 8 files changed, 207 insertions(+), 1 deletion(-)
+ create mode 100644 sepolicy/vendor/ax_diagnostics.te
+ create mode 100644 sepolicy/vendor/ax_kernel_manager.te
+ create mode 100644 sepolicy/vendor/init.te
+
+diff --git a/configs/audio/audio_effects_config.xml b/configs/audio/audio_effects_config.xml
+index fc4d232..5a74740 100644
+--- a/configs/audio/audio_effects_config.xml
++++ b/configs/audio/audio_effects_config.xml
+@@ -47,6 +47,7 @@
+         <library name="volumesw" path="libvolumesw.so"/>
+         <library name="extensioneffect" path="libextensioneffect.so"/>
+         <library name="spatializersw" path="libspatializeraidl.so"/>
++        <library name="axionfx" path="libaxionfxaidl.so"/>
+     </libraries>
+ 
+     <!-- list of effects to load.
+@@ -88,6 +89,7 @@
+         <effect name="extension_effect" library="extensioneffect" uuid="fa81dd00-588b-11ed-9b6a-0242ac120002" type="fa81de0e-588b-11ed-9b6a-0242ac120002"/>
+         <effect name="acoustic_echo_canceler" library="pre_processing" uuid="bb392ec0-8d4d-11e0-a896-0002a5d5c51b"/>
+         <effect name="noise_suppression" library="pre_processing" uuid="c06c8400-8e06-11e0-9cb6-0002a5d5c51b"/>
++        <effect name="axionfx" library="axionfx" uuid="f35cb927-a887-4f3d-847f-770634486d53" type="5867be72-4060-4c55-a378-c1cdef3e1353"/>
+         <!-- <effect name="spatializer" library="spatializersw" uuid="fa81a880-588b-11ed-9b6a-0242ac120002"/> -->
+     </effects>
+ 
+diff --git a/init/init.mt6768.rc b/init/init.mt6768.rc
+index 7d44fa6..1b49384 100644
+--- a/init/init.mt6768.rc
++++ b/init/init.mt6768.rc
+@@ -174,6 +174,19 @@ on late-fs
+     write /sys/kernel/tracing/trace_marker "E"
+     write /proc/bootprof "INIT:Mount_END --late"
+ 
++# GPU DVFS defaults. MediaTek's default "dummy" devfreq governor defers to
++# the proprietary GED DVFS, which reacts too slowly for bursty UI work: with
++# window blurs on, SystemUI sat at 18% janky frames (99th pct 150ms) because
++# the GPU was still at a low OPP when the frame arrived. simple_ondemand with
++# a short polling interval brought that to 7% (99th 73ms), close to pinning
++# the GPU at max (4.6%) but still clocking down at idle; the timer is
++# deferrable so it does not wake an idle CPU. Runs at "on boot" so that a
++# governor the user picked in the kernel manager (restored later, at
++# system_server's systemReady) still wins over this default.
++on boot
++    write /sys/class/devfreq/13040000.mali/governor simple_ondemand
++    write /sys/class/devfreq/13040000.mali/polling_interval 10
++
+ on post-fs-data
+     write /proc/bootprof "INIT:post-fs-data"
+     wait_for_prop vendor.all.modules.ready 1
+@@ -676,6 +689,53 @@ on boot
+     chmod 0660 /sys/devices/system/cpu/cpufreq/policy0/scaling_governor
+     chown system system /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
+     chmod 0660 /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
++    # GPU devfreq nodes: unlike CPU's scaling_governor above, the kernel
++    # gives these no Android-specific ownership at all (root:root 0644,
++    # confirmed live). AxKernelManagerService writes governor via a plain
++    # FileUtils.stringToFile() with no privileged indirection - system_server
++    # (UID system, not root) got a bare DAC EACCES even with sepolicy fully
++    # correct (see ax_kernel_manager.te) until this file was chowned like
++    # scaling_governor is.
++    #
++    # min_freq/max_freq ALSO need this, which was unexpected: they additionally
++    # go through PowerManagerInternal.setNodeCeiling() (a PowerHAL binder call,
++    # in notifyPowerManager()), so the working theory was that path alone would
++    # cover them without touching ownership here - it doesn't, confirmed live
++    # the same way as governor (chown fixed it, tested before committing).
++    # Whatever the PowerHAL ceiling call actually does on this platform, the
++    # visible sysfs value only followed the picker once these were chowned too.
++    chown system system /sys/class/devfreq/13040000.mali/governor
++    chmod 0660 /sys/class/devfreq/13040000.mali/governor
++    chown system system /sys/class/devfreq/13040000.mali/min_freq
++    chmod 0660 /sys/class/devfreq/13040000.mali/min_freq
++    chown system system /sys/class/devfreq/13040000.mali/max_freq
++    chmod 0660 /sys/class/devfreq/13040000.mali/max_freq
++    chown system system /proc/gpufreqv2/fix_target_opp_index
++    chmod 0660 /proc/gpufreqv2/fix_target_opp_index
++    # axion_gpu_range (LIMIT_AXION_USER min/max range limiter) defaults to
++    # root:root like every other gpufreqv2 debug node here - system_server
++    # gets EACCES writing it without this, same class of bug as the nodes
++    # above. Confirmed live: chown+chmod alone (no reboot) let the write
++    # through immediately.
++    chown system system /proc/gpufreqv2/axion_gpu_range
++    chmod 0660 /proc/gpufreqv2/axion_gpu_range
++    # gpu_working_opp_table is read-only for the UI (freq list for the
++    # slider labels), but defaults to root:root like the other gpufreqv2
++    # nodes - system_server can't even read it without this, which makes
++    # AxKernelConfigLoader.addGpuOppIndexIfPresent() find an empty table and
++    # silently drop the whole GPU group from the Kernel Manager screen.
++    # Confirmed live on device: chown alone (no reboot needed) makes the
++    # slider reappear immediately.
++    chown system system /proc/gpufreqv2/gpu_working_opp_table
++    chmod 0660 /proc/gpufreqv2/gpu_working_opp_table
++    # GED's gpu_utilization node defaults to root:root 0440 - AxDiagnostics
++    # (ax_diagnostics domain, runs as uid system) has sepolicy read access
++    # to sysfs_ged already, but DAC alone still blocks it (same class of
++    # bug as the gpufreqv2 nodes above). Confirmed live: chown alone made
++    # AxDiagnostics' GPU tab go from blank to reporting the real value
++    # (27%/796MHz), no reboot needed.
++    chown root system /sys/kernel/ged/hal/gpu_utilization
++    chmod 0440 /sys/kernel/ged/hal/gpu_utilization
+     chown root   system /sys/kernel/debug/binder/transaction_log_enable
+     chown root   system /sys/kernel/debug/binder/perf_evalue
+     chown system system /sys/devices/system/cpu/rq-stats/htasks_thresh
+diff --git a/sepolicy/vendor/ax_diagnostics.te b/sepolicy/vendor/ax_diagnostics.te
+new file mode 100644
+index 0000000..3b5138a
+--- /dev/null
++++ b/sepolicy/vendor/ax_diagnostics.te
+@@ -0,0 +1,67 @@
++#
++# SPDX-FileCopyrightText: The LineageOS Project
++# SPDX-License-Identifier: Apache-2.0
++#
++
++# MTK-specific sysfs access for ax_diagnostics (device/axion/common only ships
++# a vendor/qcom variant of this policy; there is no BOARD_USES_MTK_HARDWARE
++# equivalent upstream, so this lives here instead). Without these the app
++# silently gets EACCES on every one of these nodes and reports 0/unknown for
++# per-core frequency, thermal, RTC, battery and TEE stats even though the
++# underlying kernel data is present and correct.
++allow ax_diagnostics sysfs_therm:dir r_dir_perms;
++allow ax_diagnostics sysfs_therm:file r_file_perms;
++allow ax_diagnostics sysfs_rtc:dir r_dir_perms;
++allow ax_diagnostics sysfs_rtc:file r_file_perms;
++allow ax_diagnostics mtee_trusty_file:dir r_dir_perms;
++allow ax_diagnostics mtee_trusty_file:file r_file_perms;
++allow ax_diagnostics sysfs_dvfsrc_dbg:dir r_dir_perms;
++allow ax_diagnostics sysfs_dvfsrc_dbg:file r_file_perms;
++allow ax_diagnostics sysfs_vbus:dir r_dir_perms;
++allow ax_diagnostics sysfs_vbus:file r_file_perms;
++allow ax_diagnostics sysfs_cache_status:dir r_dir_perms;
++allow ax_diagnostics sysfs_cache_status:file r_file_perms;
++allow ax_diagnostics sysfs_camera_max_bw_v2:dir r_dir_perms;
++allow ax_diagnostics sysfs_camera_max_bw_v2:file r_file_perms;
++allow ax_diagnostics sysfs_dt_firmware_android:dir r_dir_perms;
++allow ax_diagnostics sysfs_dt_firmware_android:file r_file_perms;
++allow ax_diagnostics sysfs_emi_ctrl_concurrency_scenario:dir r_dir_perms;
++allow ax_diagnostics sysfs_emi_ctrl_concurrency_scenario:file r_file_perms;
++allow ax_diagnostics sysfs_extcon:dir r_dir_perms;
++allow ax_diagnostics sysfs_extcon:file r_file_perms;
++allow ax_diagnostics sysfs_fs_chg_file:dir r_dir_perms;
++allow ax_diagnostics sysfs_fs_chg_file:file r_file_perms;
++allow ax_diagnostics sysfs_headset:dir r_dir_perms;
++allow ax_diagnostics sysfs_headset:file r_file_perms;
++allow ax_diagnostics sysfs_keypad_file:dir r_dir_perms;
++allow ax_diagnostics sysfs_keypad_file:file r_file_perms;
++allow ax_diagnostics sysfs_mtk_fpsgo:dir r_dir_perms;
++allow ax_diagnostics sysfs_mtk_fpsgo:file r_file_perms;
++allow ax_diagnostics sysfs_mtk_mmqos_scen_v2:dir r_dir_perms;
++allow ax_diagnostics sysfs_mtk_mmqos_scen_v2:file r_file_perms;
++allow ax_diagnostics sysfs_pmu:dir r_dir_perms;
++allow ax_diagnostics sysfs_pmu:file r_file_perms;
++allow ax_diagnostics sysfs_pump_express:dir r_dir_perms;
++allow ax_diagnostics sysfs_pump_express:file r_file_perms;
++allow ax_diagnostics sysfs_sensor:dir r_dir_perms;
++allow ax_diagnostics sysfs_sensor:file r_file_perms;
++allow ax_diagnostics sysfs_usb_nonplat:dir r_dir_perms;
++allow ax_diagnostics sysfs_usb_nonplat:file r_file_perms;
++allow ax_diagnostics sys_mt6577_auxadc:dir r_dir_perms;
++allow ax_diagnostics sys_mt6577_auxadc:file r_file_perms;
++allow ax_diagnostics teei_control_file:dir r_dir_perms;
++allow ax_diagnostics teei_control_file:file r_file_perms;
++
++# /sys/class/devfreq itself (not the vendor_sysfs_mali_devfreq-labelled
++# node under it - see ax_kernel_manager.te): GpuInfo.kt scans this
++# directory by name to find the Mali entry, since its address varies
++# per SoC and the app cannot hardcode it the way the 3 Qualcomm fallback
++# paths already there do.
++allow ax_diagnostics sysfs_devfreq_dir:dir r_dir_perms;
++allow ax_diagnostics sysfs_devfreq_dir:lnk_file r_file_perms;
++
++# GPU busy%: no devfreq driver on this platform exposes a load/busy
++# attribute (confirmed live), so GpuInfo.kt falls back to MediaTek's
++# proprietary GED figure at /sys/kernel/ged/hal/gpu_utilization instead.
++allow ax_diagnostics sysfs_ged:dir r_dir_perms;
++allow ax_diagnostics sysfs_ged:file r_file_perms;
+diff --git a/sepolicy/vendor/ax_kernel_manager.te b/sepolicy/vendor/ax_kernel_manager.te
+new file mode 100644
+index 0000000..47602e7
+--- /dev/null
++++ b/sepolicy/vendor/ax_kernel_manager.te
+@@ -0,0 +1,45 @@
++# Axion kernel manager on MediaTek. device/axion/common only ships the
++# Qualcomm rules (sepolicy/vendor/qcom/ax_kernel_manager.te, vendor_sysfs_kgsl
++# and vendor_sysfs_devfreq); the CPU side works here anyway because AOSP core
++# policy already lets system_server write sysfs_devices_system_cpu, but the
++# GPU devfreq node was plain sysfs and every write was denied:
++#   W AxKernelManager: ErrnoException: open failed: EACCES (Permission denied)
++#   avc: denied { getattr } for comm="android.hardwar" path=".../13040000.mali/max_freq"
++#        scontext=u:r:hal_power_default:s0 tcontext=u:object_r:sysfs:s0
++# The node is now vendor_sysfs_mali_devfreq (file.te / genfs_contexts).
++
++# AxKernelManagerService writes min_freq/max_freq/governor via FileUtils.
++allow system_server vendor_sysfs_mali_devfreq:dir r_dir_perms;
++allow system_server vendor_sysfs_mali_devfreq:file rw_file_perms;
++allow system_server vendor_sysfs_mali_devfreq:lnk_file read;
++
++# notifyPowerManager() -> PowerManagerInternal.setNodeCeiling() hands the same
++# path to the PowerHAL.
++allow hal_power_default vendor_sysfs_mali_devfreq:dir r_dir_perms;
++allow hal_power_default vendor_sysfs_mali_devfreq:file rw_file_perms;
++
++# Boot-time defaults from init.mt6768.rc (governor + polling_interval).
++allow vendor_init vendor_sysfs_mali_devfreq:dir r_dir_perms;
++allow vendor_init vendor_sysfs_mali_devfreq:file w_file_perms;
++
++# AxDiagnostics' GPU tab reads cur_freq/available_frequencies/load. It could
++# read the node while it was plain sysfs; keep that working after the relabel.
++allow ax_diagnostics vendor_sysfs_mali_devfreq:dir r_dir_perms;
++allow ax_diagnostics vendor_sysfs_mali_devfreq:file r_file_perms;
++
++# gpufreqv2 fix_target_opp_index (proc_gpufreqv2, defined upstream in
++# device/mediatek/sepolicy_vndr): the devfreq governor above is a no-op on
++# this legacy/non-GPUEB driver, so AxKernelManagerService now pins the real
++# OPP index here instead. system_server already has dir search on
++# proc_gpufreqv2 from core policy, just needed the file grant. vendor_init's
++# chown/chmod in init.mt6768.rc and hal_power_default's read/write (for
++# powerhint.json's GpuPwrLevel node) are already covered by existing rules.
++allow system_server proc_gpufreqv2:file rw_file_perms;
++
++# Boot-time chown/chmod from init.mt6768.rc (see the mali devfreq block
++# above for why: driver-created nodes default to root:root, unreachable by
++# system_server's "system" uid without this). Explicit instead of relying
++# on whatever lets the mali devfreq chown above work, since that type is
++# sysfs_type and this one is proc_type - not necessarily the same rule.
++allow vendor_init proc_gpufreqv2:dir r_dir_perms;
++allow vendor_init proc_gpufreqv2:file setattr;
+diff --git a/sepolicy/vendor/file.te b/sepolicy/vendor/file.te
+index 9f08a6d..2f34330 100644
+--- a/sepolicy/vendor/file.te
++++ b/sepolicy/vendor/file.te
+@@ -19,3 +19,12 @@ type vendor_sysfs_fingerprint, fs_type, sysfs_type;
+ # block, since vold is a coredomain and elabel_data_file isn't one of the
+ # sanctioned core/app/vendor data categories).
+ type elabel_data_file, file_type;
++
++# GPU devfreq node (/sys/devices/platform/13040000.mali/devfreq/13040000.mali,
++# reached via the /sys/class/devfreq symlink). MediaTek leaves it as plain
++# sysfs, which no core domain may write, so Axion's kernel manager could not
++# apply GPU min/max/governor here (system_server got EACCES, confirmed live)
++# and its PowerHAL ceiling notification was denied too. Mirrors what
++# device/axion/common does for Qualcomm with vendor_sysfs_devfreq. See
++# ax_kernel_manager.te for the consumers.
++type vendor_sysfs_mali_devfreq, fs_type, sysfs_type;
+diff --git a/sepolicy/vendor/genfs_contexts b/sepolicy/vendor/genfs_contexts
+index de35181..b0e0b87 100644
+--- a/sepolicy/vendor/genfs_contexts
++++ b/sepolicy/vendor/genfs_contexts
+@@ -36,3 +36,5 @@ genfscon sysfs /devices/platform/18002000.consys/wakeup
+ genfscon sysfs /devices/platform/battery-manager/power_supply/battery/wakeup                                                           u:object_r:sysfs_wakeup:s0
+ genfscon sysfs /devices/platform/charger/power_supply/mtk-mst-hvdiv-chg/wakeup                                                         u:object_r:sysfs_wakeup:s0
+ genfscon sysfs /devices/platform/charger/power_supply/mtk-slv-hvdiv-chg/wakeup                                                         u:object_r:sysfs_wakeup:s0
++genfscon sysfs /devices/platform/13040000.mali/devfreq/13040000.mali u:object_r:vendor_sysfs_mali_devfreq:s0
++genfscon sysfs /class/devfreq u:object_r:sysfs_devfreq_dir:s0
+diff --git a/sepolicy/vendor/init.te b/sepolicy/vendor/init.te
+new file mode 100644
+index 0000000..4a4f62c
+--- /dev/null
++++ b/sepolicy/vendor/init.te
+@@ -0,0 +1,21 @@
++# Axion's AxMemoryManager (axion_sdk/ax_memory_server) lowers vm.swappiness
++# for latency-sensitive foreground apps (applySwappinessTuning(), camera apps
++# get SWAPPINESS_GAMING=60 instead of the default 100). It does that by
++# setting persist.sys.ax_mem.swappiness, which system/core/rootdir/init.rc
++# turns into a write to /proc/sys/vm/swappiness.
++#
++# That write runs as init, but MediaTek labels /proc/sys/vm/swappiness as
++# proc_swappiness (device/mediatek/sepolicy_vndr/base/vendor/{file,genfs_contexts})
++# and only grants it to vendor_init, so the trigger was denied and the whole
++# per-app tuning was silently inert - confirmed live on device:
++#   avc: denied { write } for comm="init" name="swappiness"
++#   scontext=u:r:init:s0 tcontext=u:object_r:proc_swappiness:s0
++# The boot-time write in init.mt6768.rc kept working only because that one
++# runs as vendor_init.
++#
++# Mirroring the trigger into a vendor init script instead is not an option:
++# vendor_init only reads properties granted by explicit get_prop() rules and
++# has none for system_prop, which is what persist.sys.ax_mem.swappiness is.
++# Granting init this one proc type follows the existing pattern in
++# system/sepolicy/private/init.te (proc_drop_caches, proc_pressure_mem).
++allow init proc_swappiness:file w_file_perms;
+diff --git a/vendor.prop b/vendor.prop
+index c5c305e..4a25f64 100644
+--- a/vendor.prop
++++ b/vendor.prop
+@@ -246,7 +246,7 @@ ro.surface_flinger.game_default_frame_rate_override=60
+ ro.surface_flinger.has_HDR_display=false
+ ro.surface_flinger.max_frame_buffer_acquired_buffers=3
+ ro.surface_flinger.primary_display_orientation=ORIENTATION_0
+-ro.surface_flinger.supports_background_blur=0
++ro.surface_flinger.supports_background_blur=1
+ vendor.sf.hwc_repaint_fmt=3
+ 
+ # TEE

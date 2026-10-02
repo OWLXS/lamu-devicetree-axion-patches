@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vigaz <pudimdebacon3@gmail.com>
+Date: Thu, 1 Oct 2026 22:09:30 -0300
+Subject: [PATCH 1/2] Axion: identity vars + defaults_common.mk inherit
+
+AXION_MAINTAINER/AXION_PROCESSOR/AXION_CAMERA_*_INFO feed device/axion/
+common's own ro.axion.*/persist.sys.axion_* properties. Camera info left
+unset upstream so VendorSupport probes real hardware, but this tree sets
+it explicit since the g05/g15 SKU is already known per build.
+
+Requires device/axion/common in the manifest (BoardConfigAxion.mk is
+included separately in BoardConfig.mk, see the matching patch there).
+---
+ lineage_lamu.mk | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/lineage_lamu.mk b/lineage_lamu.mk
+index f889d45..5ba1975 100644
+--- a/lineage_lamu.mk
++++ b/lineage_lamu.mk
+@@ -5,6 +5,12 @@
+ 
+ TARGET_DISABLE_EPPE := true
+ 
++# Identity variables for Axion
++AXION_MAINTAINER := TheMoonX_-
++AXION_PROCESSOR := MediaTek_Helio_G81_Extreme
++AXION_CAMERA_REAR_INFO := 50,2
++AXION_CAMERA_FRONT_INFO := 8
++
+ # Hardware feature flags
+ BYPASS_CHARGE_SUPPORTED := false
+ HBM_SUPPORTED := false
+@@ -40,6 +46,14 @@ $(call inherit-product, $(SRC_TARGET_DIR)/product/full_base_telephony.mk)
+ # Inherit from device makefile.
+ $(call inherit-product, device/motorola/lamu/device.mk)
+ 
++# version.mk publishes AXION_PROCESSOR as persist.sys.axion_cpu_info, but
++# VendorSupport reads persist.sys.axion_processor_info.
++PRODUCT_PRODUCT_PROPERTIES += \
++    persist.sys.axion_processor_info=$(AXION_PROCESSOR)
++
++# Inherit Axion common defaults
++$(call inherit-product, device/axion/common/config/defaults_common.mk)
++
+ LINEAGE_BUILDTYPE := UNOFFICIAL
+ 
+ # Inherit some common LineageOS stuff.
